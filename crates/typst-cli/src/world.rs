@@ -2,6 +2,7 @@ use std::cell::{OnceCell, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fs;
 use std::hash::Hash;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Datelike, Local};
@@ -25,6 +26,8 @@ pub struct SystemWorld {
     root: PathBuf,
     /// The input path.
     main: FileId,
+    /// Source of the input file if it is provided as standard input.
+    stdin_main_source: Option<Source>,
     /// Typst's standard library.
     library: Prehashed<Library>,
     /// Metadata about discovered fonts.
@@ -45,6 +48,11 @@ pub struct SystemWorld {
 impl SystemWorld {
     /// Create a new system world.
     pub fn new(command: &SharedArgs) -> StrResult<Self> {
+        #[cfg(unix)]
+        if command.input.as_os_str() == "-" || command.input.as_os_str() == "/dev/stdin" {
+            return Self::new_stdin(command);
+        }
+
         let mut searcher = FontSearcher::new();
         searcher.search(&command.font_paths);
 
@@ -74,6 +82,7 @@ impl SystemWorld {
         Ok(Self {
             root,
             main: FileId::new(None, &project_input),
+            stdin_main_source: None,
             library: Prehashed::new(typst_library::build()),
             book: Prehashed::new(searcher.book),
             fonts: searcher.fonts,
@@ -81,6 +90,36 @@ impl SystemWorld {
             paths: RefCell::default(),
             now: OnceCell::new(),
         })
+    }
+
+    #[cfg(unix)]
+    pub fn new_stdin(command: &SharedArgs) -> StrResult<Self> {
+        let mut searcher = FontSearcher::new();
+        searcher.search(&command.font_paths);
+
+        let root = std::env::current_dir()
+            .map_err(|_| eco_format!("current directory is inaccessible"))?;
+
+        let mut contents = String::new();
+        std::io::stdin()
+            .read_to_string(&mut contents)
+            .map_err(|e| FileError::from_io(e, Path::new("/dev/stdin")))?;
+
+        let main = FileId::detached();
+
+        let world = Self {
+            root,
+            main,
+            stdin_main_source: Some(Source::new(main, contents)),
+            library: Prehashed::new(typst_library::build()),
+            book: Prehashed::new(searcher.book),
+            fonts: searcher.fonts,
+            hashes: RefCell::default(),
+            paths: RefCell::default(),
+            now: OnceCell::new(),
+        };
+
+        Ok(world)
     }
 
     /// The id of the main source file.
@@ -121,6 +160,10 @@ impl World for SystemWorld {
     }
 
     fn source(&self, id: FileId) -> FileResult<Source> {
+        if let Some(main_source) = self.stdin_main_source.clone() {
+            return Ok(main_source);
+        }
+
         self.slot(id)?.source()
     }
 
